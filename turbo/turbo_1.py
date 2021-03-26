@@ -9,9 +9,11 @@
 # limitations under the License.                                              #
 ###############################################################################
 
+import logging
 import math
 import sys
-from copy import deepcopy
+# from copy import deepcopy
+from typing import Optional
 
 import gpytorch
 import numpy as np
@@ -20,6 +22,8 @@ from torch.quasirandom import SobolEngine
 
 from .gp import train_gp
 from .utils import from_unit_cube, latin_hypercube, to_unit_cube
+
+logger = logging.getLogger("turbo")
 
 
 class Turbo1:
@@ -48,20 +52,21 @@ class Turbo1:
     """
 
     def __init__(
-        self,
-        f,
-        lb,
-        ub,
-        n_init,
-        max_evals,
-        batch_size=1,
-        verbose=True,
-        use_ard=True,
-        max_cholesky_size=2000,
-        n_training_steps=50,
-        min_cuda=1024,
-        device="cpu",
-        dtype="float64",
+            self,
+            f,
+            lb,
+            ub,
+            n_init,
+            max_evals,
+            batch_size=1,
+            verbose=True,
+            use_ard=True,
+            max_cholesky_size=2000,
+            n_training_steps=50,
+            min_cuda=1024,
+            device="cpu",
+            dtype="float64",
+            boundary=None
     ):
 
         # Very basic input checks
@@ -77,10 +82,12 @@ class Turbo1:
         assert max_evals > n_init and max_evals > batch_size
         assert device == "cpu" or device == "cuda"
         assert dtype == "float32" or dtype == "float64"
-        if device == "cuda":
-            assert torch.cuda.is_available(), "can't use cuda if it's not available"
+
+        if device == "cuda" and not torch.cuda.is_available():
+            device = "cpu"
 
         # Save function information
+        self.boundary = boundary if boundary else []
         self.f = f
         self.dim = len(lb)
         self.lb = lb
@@ -96,16 +103,16 @@ class Turbo1:
         self.n_training_steps = n_training_steps
 
         # Hyperparameters
-        self.mean = np.zeros((0, 1))
-        self.signal_var = np.zeros((0, 1))
-        self.noise_var = np.zeros((0, 1))
-        self.lengthscales = np.zeros((0, self.dim)) if self.use_ard else np.zeros((0, 1))
+        # self.mean = np.zeros((0, 1))
+        # self.signal_var = np.zeros((0, 1))
+        # self.noise_var = np.zeros((0, 1))
+        # self.lengthscales = np.zeros((0, self.dim)) if self.use_ard else np.zeros((0, 1))
 
         # Tolerances and counters
         self.n_cand = min(100 * self.dim, 5000)
         self.failtol = np.ceil(np.max([4.0 / batch_size, self.dim / batch_size]))
         self.succtol = 3
-        self.n_evals = 0
+        # self.n_evals = 0
 
         # Trust region sizes
         self.length_min = 0.5 ** 7
@@ -113,43 +120,45 @@ class Turbo1:
         self.length_init = 0.8
 
         # Save the full history
-        self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0, 1))
+        # self.X = np.zeros((0, self.dim))
+        # self.fX = np.zeros((0, 1))
+        # self.X_hist = np.zeros((0, self.dim))
+        # self.fX_hist = np.zeros((0, 1))
 
         # Device and dtype for GPyTorch
         self.min_cuda = min_cuda
         self.dtype = torch.float32 if dtype == "float32" else torch.float64
         self.device = torch.device("cuda") if device == "cuda" else torch.device("cpu")
-        if self.verbose:
-            print("Using dtype = %s \nUsing device = %s" % (self.dtype, self.device))
-            sys.stdout.flush()
-
+        # if self.verbose:
+        #     print("Using dtype = %s \nUsing device = %s" % (self.dtype, self.device))
+        #     sys.stdout.flush()
+        # print("===>boundary:", self.boundary)
         # Initialize parameters
-        self._restart()
+        # self._restart()
 
-    def _restart(self):
-        self._X = []
-        self._fX = []
-        self.failcount = 0
-        self.succcount = 0
-        self.length = self.length_init
+    # def _restart(self):
+    #     self._X = []
+    #     self._fX = []
+    #     self.failcount = 0
+    #     self.succcount = 0
+    #     self.length = self.length_init
+    # 
+    # def _adjust_length(self, fX_next):
+    #     if np.min(fX_next) < np.min(self._fX) - 1e-3 * math.fabs(np.min(self._fX)):
+    #         self.succcount += 1
+    #         self.failcount = 0
+    #     else:
+    #         self.succcount = 0
+    #         self.failcount += 1
+    # 
+    #     if self.succcount == self.succtol:  # Expand trust region
+    #         self.length = min([2.0 * self.length, self.length_max])
+    #         self.succcount = 0
+    #     elif self.failcount == self.failtol:  # Shrink trust region
+    #         self.length /= 2.0
+    #         self.failcount = 0
 
-    def _adjust_length(self, fX_next):
-        if np.min(fX_next) < np.min(self._fX) - 1e-3 * math.fabs(np.min(self._fX)):
-            self.succcount += 1
-            self.failcount = 0
-        else:
-            self.succcount = 0
-            self.failcount += 1
-
-        if self.succcount == self.succtol:  # Expand trust region
-            self.length = min([2.0 * self.length, self.length_max])
-            self.succcount = 0
-        elif self.failcount == self.failtol:  # Shrink trust region
-            self.length /= 2.0
-            self.failcount = 0
-
-    def _create_candidates(self, X, fX, length, n_training_steps, hypers):
+    def _create_candidates(self, X, fX, length, hypers):
         """Generate candidates assuming X has been scaled to [0,1]^d."""
         # Pick the center as the point with the smallest function values
         # NOTE: This may not be robust to noise, in which case the posterior mean of the GP can be used instead
@@ -158,7 +167,7 @@ class Turbo1:
         # Standardize function values.
         mu, sigma = np.median(fX), fX.std()
         sigma = 1.0 if sigma < 1e-6 else sigma
-        fX = (deepcopy(fX) - mu) / sigma
+        fX = (fX - mu) / sigma
 
         # Figure out what device we are running on
         if len(X) < self.min_cuda:
@@ -171,7 +180,7 @@ class Turbo1:
             X_torch = torch.tensor(X).to(device=device, dtype=dtype)
             y_torch = torch.tensor(fX).to(device=device, dtype=dtype)
             gp = train_gp(
-                train_x=X_torch, train_y=y_torch, use_ard=self.use_ard, num_steps=n_training_steps, hypers=hypers
+                train_x=X_torch, train_y=y_torch, use_ard=self.use_ard, num_steps=self.n_training_steps, hypers=hypers
             )
 
             # Save state dict
@@ -185,7 +194,7 @@ class Turbo1:
         lb = np.clip(x_center - weights * length / 2.0, 0.0, 1.0)
         ub = np.clip(x_center + weights * length / 2.0, 0.0, 1.0)
 
-        # Draw a Sobolev sequence in [lb, ub]
+        # Draw a Sobolev sequence in [lb, ub] in [0, 1]
         seed = np.random.randint(int(1e6))
         sobol = SobolEngine(self.dim, scramble=True, seed=seed)
         pert = sobol.draw(self.n_cand).to(dtype=dtype, device=device).cpu().detach().numpy()
@@ -214,7 +223,6 @@ class Turbo1:
         with torch.no_grad(), gpytorch.settings.max_cholesky_size(self.max_cholesky_size):
             X_cand_torch = torch.tensor(X_cand).to(device=device, dtype=dtype)
             y_cand = gp.likelihood(gp(X_cand_torch)).sample(torch.Size([self.batch_size])).t().cpu().detach().numpy()
-
         # Remove the torch variables
         del X_torch, y_torch, X_cand_torch, gp
 
@@ -229,73 +237,139 @@ class Turbo1:
         for i in range(self.batch_size):
             # Pick the best point and make sure we never pick it again
             indbest = np.argmin(y_cand[:, i])
-            X_next[i, :] = deepcopy(X_cand[indbest, :])
+            X_next[i, :] = X_cand[indbest, :].copy()
             y_cand[indbest, :] = np.inf
         return X_next
 
-    def optimize(self):
-        """Run the full optimization process."""
-        while self.n_evals < self.max_evals:
-            if len(self._fX) > 0 and self.verbose:
-                n_evals, fbest = self.n_evals, self._fX.min()
-                print(f"{n_evals}) Restarting with fbest = {fbest:.4}")
-                sys.stdout.flush()
+    def get_samples_in_region(self, cands):
+        if len(self.boundary) == 0:
+            # no boundary, return all candidates
+            return 1.0, cands
+        elif len(cands) == 0:
+            return 0.0, cands
+        else:
+            # with boundaries, return filtered cands
+            total = len(cands)
+            for node in self.boundary:
+                boundary = node[0].classifier.svm
+                if len(cands) == 0:
+                    return 0, np.array([])
+                assert len(cands) > 0
+                cands = cands[boundary.predict(cands) == node[1]]
+                # node[1] store the direction to go
+            ratio = len(cands) / total
+            assert len(cands) <= total
+            return ratio, cands
 
-            # Initialize parameters
-            self._restart()
-
-            # Generate and evalute initial design points
-            X_init = latin_hypercube(self.n_init, self.dim)
+    def get_init_samples(self):
+        num_samples = 5000
+        while True:
+            X_init = latin_hypercube(num_samples, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
-            fX_init = np.array([[self.f(x)] for x in X_init])
+            ratio, X_init = self.get_samples_in_region(X_init)
+            print("sampling for init:", X_init.shape, " target=", self.n_init)
+
+            # print("init ratio:", ratio, num_samples)
+            if len(X_init) > self.n_init:
+                X_init_idx = np.random.choice(len(X_init), self.n_init)
+                return X_init[X_init_idx]
+            else:
+                num_samples *= 2
+
+    # def solution_dist(self, X_max, X_min):
+    #     target = [0.67647699, 0.02470704, 0.17509452, 0.52625823, 0.01533873, 0.23564648,
+    #               0.02683509, 0.4015465, 0.06774012, 0.46741845, 0.14822474, 0.28144135,
+    #               0.37140203, 0.16719317, 0.20886799, 0.78002471, 0.08521446, 0.92605524,
+    #               0.23940475, 0.2922662, 0.72604942, 0.4934763, 0.54875525, 0.83353381,
+    #               0.91081349, 0.92451653, 0.67479518, 0.10795649, 0.23629373, 0.93527296,
+    #               0.79859278, 0.47183663, 0.60424984, 0.82342833, 0.82568537, 0.03397018,
+    #               0.17525656, 0.44860477, 0.38917436, 0.7433467, 0.38558197, 0.54083661,
+    #               0.04085656, 0.59639248, 0.9753219, 0.83503397, 0.78734637, 0.74482509,
+    #               0.74704426, 0.93000639, 0.98498581, 0.8575799, 0.97067501, 0.85890235,
+    #               0.77135328, 0.58061348, 0.96214013, 0.53402563, 0.59676158, 0.80739623]
+    #     located_in = 0
+    #     for idx in range(0, len(X_max)):
+    #         if target[idx] < X_max[idx] and target[idx] > X_min[idx]:
+    #             located_in += 1
+    #
+    #     return located_in
+
+    def optimize(self, num_samples: int, x_init: np.ndarray, fx_init: Optional[np.ndarray] = None):
+        """Run the full optimization process."""
+        n_evals = 0
+        x = np.zeros((0, self.dim))
+        fx = np.zeros((0,))
+        curr_min = float('inf')
+        while len(x) < num_samples:
+            if len(fx) > 0:
+                logger.debug(f"{n_evals}) Restarting with fbest = {fx.min():.4}")
+
+            if x_init is None:
+                x_init = self.get_init_samples()
+            if fx_init is None:
+                fx_init = self.f(x_init)
+
+            # x = np.vstack((x, x_init))
+            # fx = np.hstack((fx, fx_init))
 
             # Update budget and set as initial data for this TR
-            self.n_evals += self.n_init
-            self._X = deepcopy(X_init)
-            self._fX = deepcopy(fX_init)
+            # n_evals += len(x_init)
+            curr_x = x_init.copy()
+            curr_fx = fx_init.copy()
+            failcount = 0
+            succcount = 0
+            length = self.length_init
 
-            # Append data to the global history
-            self.X = np.vstack((self.X, deepcopy(X_init)))
-            self.fX = np.vstack((self.fX, deepcopy(fX_init)))
-
-            if self.verbose:
-                fbest = self._fX.min()
-                print(f"Starting from fbest = {fbest:.4}")
-                sys.stdout.flush()
+            logger.debug(f"Starting from fbest = {curr_fx.min():.4}")
 
             # Thompson sample to get next suggestions
-            while self.n_evals < self.max_evals and self.length >= self.length_min:
+            while len(x) < num_samples and length >= self.length_min:
                 # Warp inputs
-                X = to_unit_cube(deepcopy(self._X), self.lb, self.ub)
+                norm_x = to_unit_cube(curr_x, self.lb, self.ub)  # project X to [lb, ub] as X was in [0, 1]
 
                 # Standardize values
-                fX = deepcopy(self._fX).ravel()
+                norm_fx = curr_fx.flatten()
 
                 # Create th next batch
-                X_cand, y_cand, _ = self._create_candidates(
-                    X, fX, length=self.length, n_training_steps=self.n_training_steps, hypers={}
+                cand_x, cand_y, _ = self._create_candidates(
+                    norm_x, norm_fx, length=length, hypers={}
                 )
-                X_next = self._select_candidates(X_cand, y_cand)
+                next_x = self._select_candidates(cand_x, cand_y)
 
                 # Undo the warping
-                X_next = from_unit_cube(X_next, self.lb, self.ub)
+                next_x = from_unit_cube(next_x, self.lb, self.ub)
 
                 # Evaluate batch
-                fX_next = np.array([[self.f(x)] for x in X_next])
+                next_fx = self.f(next_x)
 
                 # Update trust region
-                self._adjust_length(fX_next)
+                curr_fx_min = np.min(curr_fx)
+                if np.min(next_fx) < curr_fx_min - 1e-3 * math.fabs(curr_fx_min):
+                    succcount += 1
+                    failcount = 0
+                else:
+                    succcount = 0
+                    failcount += 1
+
+                if succcount == self.succtol:  # Expand trust region
+                    length = min([2.0 * length, self.length_max])
+                    succcount = 0
+                elif failcount == self.failtol:  # Shrink trust region
+                    length /= 2.0
+                    failcount = 0
 
                 # Update budget and append data
-                self.n_evals += self.batch_size
-                self._X = np.vstack((self._X, X_next))
-                self._fX = np.vstack((self._fX, fX_next))
+                n_evals += self.batch_size
+                curr_x = np.vstack((curr_x, next_x))
+                curr_fx = np.hstack((curr_fx, next_fx))
 
-                if self.verbose and fX_next.min() < self.fX.min():
-                    n_evals, fbest = self.n_evals, fX_next.min()
-                    print(f"{n_evals}) New best: {fbest:.4}")
-                    sys.stdout.flush()
+                next_fx_min = next_fx.min()
+                if next_fx_min < curr_min:
+                    curr_min = next_fx_min
+                    logger.debug(f"{n_evals}) New best: {curr_min:.4}")
 
                 # Append data to the global history
-                self.X = np.vstack((self.X, deepcopy(X_next)))
-                self.fX = np.vstack((self.fX, deepcopy(fX_next)))
+                x = np.vstack((x, next_x))
+                fx = np.hstack((fx, next_fx))
+
+        return x, fx.ravel()
