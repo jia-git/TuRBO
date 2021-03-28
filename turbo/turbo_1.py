@@ -11,7 +11,6 @@
 
 import logging
 import math
-import sys
 # from copy import deepcopy
 from typing import Optional
 
@@ -35,9 +34,6 @@ class Turbo1:
     lb : Lower variable bounds, numpy.array, shape (d,).
     ub : Upper variable bounds, numpy.array, shape (d,).
     n_init : Number of initial points (2*dim is recommended), int.
-    max_evals : Total evaluation budget, int.
-    batch_size : Number of points in each batch, int.
-    verbose : If you want to print information about the optimization progress, bool.
     use_ard : If you want to use ARD for the GP kernel.
     max_cholesky_size : Largest number of training points where we use Cholesky, int
     n_training_steps : Number of training steps for learning the GP hypers, int
@@ -54,37 +50,26 @@ class Turbo1:
     def __init__(
             self,
             f,
-            lb,
-            ub,
-            n_init,
-            max_evals,
-            batch_size=1,
-            verbose=True,
-            use_ard=True,
-            max_cholesky_size=2000,
-            n_training_steps=50,
-            min_cuda=1024,
+            lb: np.ndarray,
+            ub: np.ndarray,
+            n_init: int,
+            use_ard: int = True,
+            max_cholesky_size: int =2000,
+            n_training_steps: int =50,
+            min_cuda: int =1024,
             device="cpu",
             dtype="float64",
             boundary=None
     ):
-
         # Very basic input checks
         assert lb.ndim == 1 and ub.ndim == 1
         assert len(lb) == len(ub)
         assert np.all(ub > lb)
-        assert max_evals > 0 and isinstance(max_evals, int)
         assert n_init > 0 and isinstance(n_init, int)
-        assert batch_size > 0 and isinstance(batch_size, int)
-        assert isinstance(verbose, bool) and isinstance(use_ard, bool)
-        assert max_cholesky_size >= 0 and isinstance(batch_size, int)
-        assert n_training_steps >= 30 and isinstance(n_training_steps, int)
-        assert max_evals > n_init and max_evals > batch_size
+        assert max_cholesky_size >= 0
+        assert n_training_steps >= 30
         assert device == "cpu" or device == "cuda"
         assert dtype == "float32" or dtype == "float64"
-
-        if device == "cuda" and not torch.cuda.is_available():
-            device = "cpu"
 
         # Save function information
         self.boundary = boundary if boundary else []
@@ -95,70 +80,24 @@ class Turbo1:
 
         # Settings
         self.n_init = n_init
-        self.max_evals = max_evals
-        self.batch_size = batch_size
-        self.verbose = verbose
         self.use_ard = use_ard
         self.max_cholesky_size = max_cholesky_size
         self.n_training_steps = n_training_steps
-
-        # Hyperparameters
-        # self.mean = np.zeros((0, 1))
-        # self.signal_var = np.zeros((0, 1))
-        # self.noise_var = np.zeros((0, 1))
-        # self.lengthscales = np.zeros((0, self.dim)) if self.use_ard else np.zeros((0, 1))
-
-        # Tolerances and counters
-        self.n_cand = min(100 * self.dim, 5000)
-        self.failtol = np.ceil(np.max([4.0 / batch_size, self.dim / batch_size]))
-        self.succtol = 3
-        # self.n_evals = 0
 
         # Trust region sizes
         self.length_min = 0.5 ** 7
         self.length_max = 1.6
         self.length_init = 0.8
 
-        # Save the full history
-        # self.X = np.zeros((0, self.dim))
-        # self.fX = np.zeros((0, 1))
-        # self.X_hist = np.zeros((0, self.dim))
-        # self.fX_hist = np.zeros((0, 1))
-
         # Device and dtype for GPyTorch
         self.min_cuda = min_cuda
         self.dtype = torch.float32 if dtype == "float32" else torch.float64
-        self.device = torch.device("cuda") if device == "cuda" else torch.device("cpu")
-        # if self.verbose:
-        #     print("Using dtype = %s \nUsing device = %s" % (self.dtype, self.device))
-        #     sys.stdout.flush()
-        # print("===>boundary:", self.boundary)
-        # Initialize parameters
-        # self._restart()
+        if device == "cuda" and torch.cuda.is_available():
+            self.device = torch.device("cuda") if device == "cuda" else torch.device("cpu")
+        else:
+            self.device = torch.device("cpu")
 
-    # def _restart(self):
-    #     self._X = []
-    #     self._fX = []
-    #     self.failcount = 0
-    #     self.succcount = 0
-    #     self.length = self.length_init
-    # 
-    # def _adjust_length(self, fX_next):
-    #     if np.min(fX_next) < np.min(self._fX) - 1e-3 * math.fabs(np.min(self._fX)):
-    #         self.succcount += 1
-    #         self.failcount = 0
-    #     else:
-    #         self.succcount = 0
-    #         self.failcount += 1
-    # 
-    #     if self.succcount == self.succtol:  # Expand trust region
-    #         self.length = min([2.0 * self.length, self.length_max])
-    #         self.succcount = 0
-    #     elif self.failcount == self.failtol:  # Shrink trust region
-    #         self.length /= 2.0
-    #         self.failcount = 0
-
-    def _create_candidates(self, X, fX, length, hypers):
+    def _create_candidates(self, n_cand, batch_size, X, fX, length, hypers):
         """Generate candidates assuming X has been scaled to [0,1]^d."""
         # Pick the center as the point with the smallest function values
         # NOTE: This may not be robust to noise, in which case the posterior mean of the GP can be used instead
@@ -197,17 +136,17 @@ class Turbo1:
         # Draw a Sobolev sequence in [lb, ub] in [0, 1]
         seed = np.random.randint(int(1e6))
         sobol = SobolEngine(self.dim, scramble=True, seed=seed)
-        pert = sobol.draw(self.n_cand).to(dtype=dtype, device=device).cpu().detach().numpy()
+        pert = sobol.draw(n_cand).to(dtype=dtype, device=device).cpu().detach().numpy()
         pert = lb + (ub - lb) * pert
 
         # Create a perturbation mask
         prob_perturb = min(20.0 / self.dim, 1.0)
-        mask = np.random.rand(self.n_cand, self.dim) <= prob_perturb
+        mask = np.random.rand(n_cand, self.dim) <= prob_perturb
         ind = np.where(np.sum(mask, axis=1) == 0)[0]
         mask[ind, np.random.randint(0, self.dim - 1, size=len(ind))] = 1
 
         # Create candidate points
-        X_cand = x_center.copy() * np.ones((self.n_cand, self.dim))
+        X_cand = x_center.copy() * np.ones((n_cand, self.dim))
         X_cand[mask] = pert[mask]
 
         # Figure out what device we are running on
@@ -222,7 +161,7 @@ class Turbo1:
         # We use Lanczos for sampling if we have enough data
         with torch.no_grad(), gpytorch.settings.max_cholesky_size(self.max_cholesky_size):
             X_cand_torch = torch.tensor(X_cand).to(device=device, dtype=dtype)
-            y_cand = gp.likelihood(gp(X_cand_torch)).sample(torch.Size([self.batch_size])).t().cpu().detach().numpy()
+            y_cand = gp.likelihood(gp(X_cand_torch)).sample(torch.Size([batch_size])).t().cpu().detach().numpy()
         # Remove the torch variables
         del X_torch, y_torch, X_cand_torch, gp
 
@@ -231,10 +170,10 @@ class Turbo1:
 
         return X_cand, y_cand, hypers
 
-    def _select_candidates(self, X_cand, y_cand):
+    def _select_candidates(self, batch_size, X_cand, y_cand):
         """Select candidates."""
-        X_next = np.ones((self.batch_size, self.dim))
-        for i in range(self.batch_size):
+        X_next = np.ones((batch_size, self.dim))
+        for i in range(batch_size):
             # Pick the best point and make sure we never pick it again
             indbest = np.argmin(y_cand[:, i])
             X_next[i, :] = X_cand[indbest, :].copy()
@@ -276,100 +215,76 @@ class Turbo1:
             else:
                 num_samples *= 2
 
-    # def solution_dist(self, X_max, X_min):
-    #     target = [0.67647699, 0.02470704, 0.17509452, 0.52625823, 0.01533873, 0.23564648,
-    #               0.02683509, 0.4015465, 0.06774012, 0.46741845, 0.14822474, 0.28144135,
-    #               0.37140203, 0.16719317, 0.20886799, 0.78002471, 0.08521446, 0.92605524,
-    #               0.23940475, 0.2922662, 0.72604942, 0.4934763, 0.54875525, 0.83353381,
-    #               0.91081349, 0.92451653, 0.67479518, 0.10795649, 0.23629373, 0.93527296,
-    #               0.79859278, 0.47183663, 0.60424984, 0.82342833, 0.82568537, 0.03397018,
-    #               0.17525656, 0.44860477, 0.38917436, 0.7433467, 0.38558197, 0.54083661,
-    #               0.04085656, 0.59639248, 0.9753219, 0.83503397, 0.78734637, 0.74482509,
-    #               0.74704426, 0.93000639, 0.98498581, 0.8575799, 0.97067501, 0.85890235,
-    #               0.77135328, 0.58061348, 0.96214013, 0.53402563, 0.59676158, 0.80739623]
-    #     located_in = 0
-    #     for idx in range(0, len(X_max)):
-    #         if target[idx] < X_max[idx] and target[idx] > X_min[idx]:
-    #             located_in += 1
-    #
-    #     return located_in
-
-    def optimize(self, num_samples: int, x_init: np.ndarray, fx_init: Optional[np.ndarray] = None):
+    def optimize(self, num_samples: int, batch_size: int,
+                 x_init: Optional[np.ndarray] = None, fx_init: Optional[np.ndarray] = None):
         """Run the full optimization process."""
-        n_evals = 0
-        x = np.zeros((0, self.dim))
-        fx = np.zeros((0,))
-        curr_min = float('inf')
-        while len(x) < num_samples:
-            if len(fx) > 0:
-                logger.debug(f"{n_evals}) Restarting with fbest = {fx.min():.4}")
+        n_cand = min(100 * self.dim, 5000)
+        failtol = np.ceil(np.max([4.0 / batch_size, self.dim / batch_size]))
+        succtol = 3
 
-            if x_init is None:
-                x_init = self.get_init_samples()
-            if fx_init is None:
-                fx_init = self.f(x_init)
+        if x_init is None:
+            x_init = self.get_init_samples()
+        if fx_init is None:
+            fx_init = self.f(x_init)
+        x = np.empty((0, self.dim))
+        fx = np.empty((0,))
 
-            # x = np.vstack((x, x_init))
-            # fx = np.hstack((fx, fx_init))
+        # Update budget and set as initial data for this TR
+        curr_x = x_init.copy()
+        curr_fx = fx_init.copy()
+        curr_fx_min = curr_fx.min()
+        failcount = 0
+        succcount = 0
+        length = self.length_init
 
-            # Update budget and set as initial data for this TR
-            # n_evals += len(x_init)
-            curr_x = x_init.copy()
-            curr_fx = fx_init.copy()
-            failcount = 0
-            succcount = 0
-            length = self.length_init
+        logger.debug(f"Starting from fbest = {curr_fx_min:.4}")
 
-            logger.debug(f"Starting from fbest = {curr_fx.min():.4}")
+        # Thompson sample to get next suggestions
+        while len(x) < num_samples and length >= self.length_min:
+            # Warp inputs
+            norm_x = to_unit_cube(curr_x, self.lb, self.ub)  # project X to [lb, ub] as X was in [0, 1]
 
-            # Thompson sample to get next suggestions
-            while len(x) < num_samples and length >= self.length_min:
-                # Warp inputs
-                norm_x = to_unit_cube(curr_x, self.lb, self.ub)  # project X to [lb, ub] as X was in [0, 1]
+            # Standardize values
+            norm_fx = curr_fx.flatten()
 
-                # Standardize values
-                norm_fx = curr_fx.flatten()
+            # Create th next batch
+            cand_x, cand_y, _ = self._create_candidates(
+                n_cand, batch_size, norm_x, norm_fx, length=length, hypers={}
+            )
+            next_x = self._select_candidates(batch_size, cand_x, cand_y)
 
-                # Create th next batch
-                cand_x, cand_y, _ = self._create_candidates(
-                    norm_x, norm_fx, length=length, hypers={}
-                )
-                next_x = self._select_candidates(cand_x, cand_y)
+            # Undo the warping
+            next_x = from_unit_cube(next_x, self.lb, self.ub)
 
-                # Undo the warping
-                next_x = from_unit_cube(next_x, self.lb, self.ub)
+            # Evaluate batch
+            next_fx = self.f(next_x)
 
-                # Evaluate batch
-                next_fx = self.f(next_x)
+            # Update trust region
+            curr_fx_min = curr_fx.min()
+            next_fx_min = next_fx.min()
+            if next_fx_min < curr_fx_min - 1e-3 * math.fabs(curr_fx_min):
+                succcount += 1
+                failcount = 0
+            else:
+                succcount = 0
+                failcount += 1
 
-                # Update trust region
-                curr_fx_min = np.min(curr_fx)
-                if np.min(next_fx) < curr_fx_min - 1e-3 * math.fabs(curr_fx_min):
-                    succcount += 1
-                    failcount = 0
-                else:
-                    succcount = 0
-                    failcount += 1
+            if succcount == succtol:  # Expand trust region
+                length = min([2.0 * length, self.length_max])
+                succcount = 0
+            elif failcount == failtol:  # Shrink trust region
+                length /= 2.0
+                failcount = 0
 
-                if succcount == self.succtol:  # Expand trust region
-                    length = min([2.0 * length, self.length_max])
-                    succcount = 0
-                elif failcount == self.failtol:  # Shrink trust region
-                    length /= 2.0
-                    failcount = 0
+            # Update budget and append data
+            curr_x = np.vstack((curr_x, next_x))
+            curr_fx = np.hstack((curr_fx, next_fx))
 
-                # Update budget and append data
-                n_evals += self.batch_size
-                curr_x = np.vstack((curr_x, next_x))
-                curr_fx = np.hstack((curr_fx, next_fx))
+            x = np.vstack((x, next_x))
+            fx = np.hstack((fx, next_fx))
 
-                next_fx_min = next_fx.min()
-                if next_fx_min < curr_min:
-                    curr_min = next_fx_min
-                    logger.debug(f"{n_evals}) New best: {curr_min:.4}")
-
-                # Append data to the global history
-                x = np.vstack((x, next_x))
-                fx = np.hstack((fx, next_fx))
+            if next_fx_min < curr_fx_min:
+                curr_min = next_fx_min
+                logger.debug(f"{len(x)}) New best: {curr_min:.4}")
 
         return x, fx.ravel()
