@@ -219,20 +219,24 @@ class Turbo1:
                  x_init: Optional[np.ndarray] = None, fx_init: Optional[np.ndarray] = None):
         """Run the full optimization process."""
         n_cand = min(100 * self.dim, 5000)
-        failtol = np.ceil(np.max([4.0 / batch_size, self.dim / batch_size]))
-        succtol = 3
+        # failtol = np.ceil(np.max([4.0 / batch_size, self.dim / batch_size]))
+        # succtol = 3
 
         if x_init is None:
             x_init = self.get_init_samples()
         if fx_init is None:
             fx_init = self.f(x_init)
-        x = np.empty((0, self.dim))
-        fx = np.empty((0,))
+        # x = np.empty((0, self.dim))
+        # fx = np.empty((0,))
+        total_samples = num_samples + len(x_init)
 
         # Update budget and set as initial data for this TR
-        curr_x = x_init.copy()
-        curr_fx = fx_init.copy()
-        curr_fx_min = curr_fx.min()
+        # curr_x = x_init.copy()
+        # curr_fx = fx_init.copy()
+        # curr_fx_min = curr_fx.min()
+        x = x_init.copy()
+        fx = fx_init.copy()
+        curr_fx_min = fx.min()
         failcount = 0
         succcount = 0
         length = self.length_init
@@ -240,12 +244,12 @@ class Turbo1:
         logger.debug(f"Starting from fbest = {curr_fx_min:.4}")
 
         # Thompson sample to get next suggestions
-        while len(x) < num_samples and length >= self.length_min:
+        while len(x) < total_samples and length >= self.length_min:
             # Warp inputs
-            norm_x = to_unit_cube(curr_x, self.lb, self.ub)  # project X to [lb, ub] as X was in [0, 1]
+            norm_x = to_unit_cube(x, self.lb, self.ub)  # project X to [lb, ub] as X was in [0, 1]
 
             # Standardize values
-            norm_fx = curr_fx.flatten()
+            norm_fx = fx.flatten()
 
             # Create th next batch
             cand_x, cand_y, _ = self._create_candidates(
@@ -260,25 +264,27 @@ class Turbo1:
             next_fx = self.f(next_x)
 
             # Update trust region
-            curr_fx_min = curr_fx.min()
+            curr_fx_min = fx.min()
             next_fx_min = next_fx.min()
             if next_fx_min < curr_fx_min - 1e-3 * math.fabs(curr_fx_min):
-                succcount += 1
-                failcount = 0
+                length = min([1.2 * length, self.length_max])
+                # succcount += 1
+                # failcount = 0
             else:
-                succcount = 0
-                failcount += 1
+                length /= 1.2
+                # succcount = 0
+                # failcount += 1
 
-            if succcount == succtol:  # Expand trust region
-                length = min([2.0 * length, self.length_max])
-                succcount = 0
-            elif failcount == failtol:  # Shrink trust region
-                length /= 2.0
-                failcount = 0
+            # if succcount == succtol:  # Expand trust region
+            #     length = min([2.0 * length, self.length_max])
+            #     succcount = 0
+            # elif failcount == failtol:  # Shrink trust region
+            #     length /= 2.0
+            #     failcount = 0
 
             # Update budget and append data
-            curr_x = np.vstack((curr_x, next_x))
-            curr_fx = np.hstack((curr_fx, next_fx))
+            # curr_x = np.vstack((curr_x, next_x))
+            # curr_fx = np.hstack((curr_fx, next_fx))
 
             x = np.vstack((x, next_x))
             fx = np.hstack((fx, next_fx))
@@ -287,4 +293,6 @@ class Turbo1:
                 curr_min = next_fx_min
                 logger.debug(f"{len(x)}) New best: {curr_min:.4}")
 
-        return x, fx.ravel()
+        fx = fx.ravel()
+        sf = fx.argsort()
+        return x[sf[:num_samples]], fx[sf[:num_samples]]
